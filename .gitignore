@@ -1,0 +1,24 @@
+__pycache__/
+.pytest_cache/
+.venv/
+env/
+venv/
+.DS_Store
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Release artifacts
+Release/
+
+# Logs
+*.log
+build_log*.txt
