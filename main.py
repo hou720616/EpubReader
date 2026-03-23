@@ -18,6 +18,8 @@ DEFAULT_CONFIG = {
     "font_size": 18,
     "font_color": "#000000",
     "font_alpha": 1.0,
+    "font_spacing": 0.0,
+    "line_spacing": 1.0,
     "bg_color": "#F2F2F2",
     "bg_alpha": 1.0,
     "shortcuts": {
@@ -126,7 +128,7 @@ class SettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("阅读设置")
         self.setModal(True)
-        self.resize(420, 300)
+        self.resize(480, 430)
         self._debug("初始化设置弹窗")
         self.config_data = load_config_data()
         self.font_family = str(self.config_data.get("font_family", DEFAULT_CONFIG["font_family"]))
@@ -134,11 +136,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.font_color = str(self.config_data.get("font_color", DEFAULT_CONFIG["font_color"]))
         self.bg_color = str(self.config_data.get("bg_color", DEFAULT_CONFIG["bg_color"]))
         self.font_alpha = float(self.config_data.get("font_alpha", DEFAULT_CONFIG["font_alpha"]))
+        self.font_spacing = float(self.config_data.get("font_spacing", DEFAULT_CONFIG["font_spacing"]))
+        self.line_spacing = float(self.config_data.get("line_spacing", DEFAULT_CONFIG["line_spacing"]))
+        self.font_spacing = min(20.0, max(0.0, self.font_spacing))
+        self.line_spacing = min(2.2, max(1.0, self.line_spacing))
         self.bg_alpha = float(self.config_data.get("bg_alpha", DEFAULT_CONFIG["bg_alpha"]))
         adaptive_targets = self.config_data.get("adaptive_targets", {})
         self.use_adaptive_font_color = bool(adaptive_targets.get("font_color", True)) if isinstance(adaptive_targets, dict) else True
         self.use_adaptive_font_size = bool(adaptive_targets.get("font_size", True)) if isinstance(adaptive_targets, dict) else True
         self.use_adaptive_bg_color = bool(adaptive_targets.get("bg_color", True)) if isinstance(adaptive_targets, dict) else True
+        self.use_adaptive_font_spacing = bool(adaptive_targets.get("font_spacing", False)) if isinstance(adaptive_targets, dict) else False
+        self.use_adaptive_line_spacing = bool(adaptive_targets.get("line_spacing", False)) if isinstance(adaptive_targets, dict) else False
         self._bg_alpha_disabled_tip = "鼠标穿透问题，暂时置灰“0%”选项"
         self._bg_alpha_zero_index = -1
         layout = QtWidgets.QVBoxLayout(self)
@@ -161,6 +169,36 @@ class SettingsDialog(QtWidgets.QDialog):
             text = "0% (仅文字)" if val == 0.0 else f"{int(val * 100)}%"
             self.bg_alpha_combo.addItem(text, val)
         form.addRow("背景不透明度", self.bg_alpha_combo)
+        self.font_spacing_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal if PYQT6 else QtCore.Qt.Horizontal)
+        self.font_spacing_slider.setRange(0, 20)
+        self.font_spacing_slider.setSingleStep(1)
+        self.font_spacing_value = QtWidgets.QLabel()
+        self.font_spacing_reset_btn = QtWidgets.QPushButton("默认")
+        self.font_spacing_reset_btn.clicked.connect(self._reset_font_spacing)
+        self.font_spacing_slider.valueChanged.connect(self._on_font_spacing_changed)
+        font_spacing_row = QtWidgets.QWidget()
+        font_spacing_layout = QtWidgets.QHBoxLayout(font_spacing_row)
+        font_spacing_layout.setContentsMargins(0, 0, 0, 0)
+        font_spacing_layout.setSpacing(8)
+        font_spacing_layout.addWidget(self.font_spacing_slider)
+        font_spacing_layout.addWidget(self.font_spacing_value)
+        font_spacing_layout.addWidget(self.font_spacing_reset_btn)
+        form.addRow("字体间距", font_spacing_row)
+        self.line_spacing_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal if PYQT6 else QtCore.Qt.Horizontal)
+        self.line_spacing_slider.setRange(100, 220)
+        self.line_spacing_slider.setSingleStep(5)
+        self.line_spacing_value = QtWidgets.QLabel()
+        self.line_spacing_reset_btn = QtWidgets.QPushButton("默认")
+        self.line_spacing_reset_btn.clicked.connect(self._reset_line_spacing)
+        self.line_spacing_slider.valueChanged.connect(self._on_line_spacing_changed)
+        line_spacing_row = QtWidgets.QWidget()
+        line_spacing_layout = QtWidgets.QHBoxLayout(line_spacing_row)
+        line_spacing_layout.setContentsMargins(0, 0, 0, 0)
+        line_spacing_layout.setSpacing(8)
+        line_spacing_layout.addWidget(self.line_spacing_slider)
+        line_spacing_layout.addWidget(self.line_spacing_value)
+        line_spacing_layout.addWidget(self.line_spacing_reset_btn)
+        form.addRow("行距", line_spacing_row)
         self._disable_zero_bg_alpha_option()
         self.bg_alpha_combo.highlighted.connect(self._on_bg_alpha_highlighted)
         layout.addLayout(form)
@@ -182,9 +220,15 @@ class SettingsDialog(QtWidgets.QDialog):
         self.adaptive_font_size_check.setChecked(self.use_adaptive_font_size)
         self.adaptive_bg_color_check = QtWidgets.QCheckBox("背景色")
         self.adaptive_bg_color_check.setChecked(self.use_adaptive_bg_color)
+        self.adaptive_font_spacing_check = QtWidgets.QCheckBox("字距")
+        self.adaptive_font_spacing_check.setChecked(self.use_adaptive_font_spacing)
+        self.adaptive_line_spacing_check = QtWidgets.QCheckBox("行距")
+        self.adaptive_line_spacing_check.setChecked(self.use_adaptive_line_spacing)
         self.adaptive_targets_row.addWidget(self.adaptive_font_color_check)
         self.adaptive_targets_row.addWidget(self.adaptive_font_size_check)
         self.adaptive_targets_row.addWidget(self.adaptive_bg_color_check)
+        self.adaptive_targets_row.addWidget(self.adaptive_font_spacing_check)
+        self.adaptive_targets_row.addWidget(self.adaptive_line_spacing_check)
         self.adaptive_targets_row.addStretch(1)
         layout.addLayout(self.adaptive_targets_row)
         self.status_label = QtWidgets.QLabel("")
@@ -230,6 +274,10 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         self._set_combo_value(self.font_alpha_combo, self.font_alpha)
         self._set_combo_value(self.bg_alpha_combo, self.bg_alpha)
+        self.font_spacing_slider.setValue(int(round(self.font_spacing)))
+        self.line_spacing_slider.setValue(int(round(self.line_spacing * 100)))
+        self.font_spacing_value.setText(f"{int(round(self.font_spacing))} px")
+        self.line_spacing_value.setText(f"{int(round(self.line_spacing * 100))}%")
 
     def _set_combo_value(self, combo: QtWidgets.QComboBox, value: float) -> None:
         for i in range(combo.count()):
@@ -272,6 +320,20 @@ class SettingsDialog(QtWidgets.QDialog):
         if index == self._bg_alpha_zero_index:
             QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), self._bg_alpha_disabled_tip, self.bg_alpha_combo)
 
+    def _on_font_spacing_changed(self, value: int) -> None:
+        self.font_spacing = float(value)
+        self.font_spacing_value.setText(f"{value} px")
+
+    def _on_line_spacing_changed(self, value: int) -> None:
+        self.line_spacing = max(1.0, value / 100.0)
+        self.line_spacing_value.setText(f"{value}%")
+
+    def _reset_font_spacing(self) -> None:
+        self.font_spacing_slider.setValue(0)
+
+    def _reset_line_spacing(self) -> None:
+        self.line_spacing_slider.setValue(100)
+
     def _light_color(self, hex_color: str) -> bool:
         color = QtGui.QColor(hex_color)
         if not color.isValid():
@@ -303,7 +365,9 @@ class SettingsDialog(QtWidgets.QDialog):
         use_font_color = self.adaptive_font_color_check.isChecked()
         use_font_size = self.adaptive_font_size_check.isChecked()
         use_bg_color = self.adaptive_bg_color_check.isChecked()
-        if not (use_font_color or use_font_size or use_bg_color):
+        use_font_spacing = self.adaptive_font_spacing_check.isChecked()
+        use_line_spacing = self.adaptive_line_spacing_check.isChecked()
+        if not (use_font_color or use_font_size or use_bg_color or use_font_spacing or use_line_spacing):
             QtWidgets.QMessageBox.information(self, "自适应识别", "请至少勾选一个识别项")
             return
         self.hide()
@@ -329,7 +393,12 @@ class SettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "自适应识别", "识别失败：未能提取有效颜色")
             return
         font_size = self._estimate_font_size(image, bg_hex, font_hex) if use_font_size else None
-        self._debug(f"识别结果 bg={bg_hex}, font={font_hex}, size={font_size}, targets={use_font_color}/{use_font_size}/{use_bg_color}")
+        font_spacing = self._estimate_font_spacing(image, bg_hex, font_hex) if use_font_spacing else None
+        line_spacing = self._estimate_line_spacing(image, bg_hex, font_hex) if use_line_spacing else None
+        self._debug(
+            f"识别结果 bg={bg_hex}, font={font_hex}, size={font_size}, font_spacing={font_spacing}, "
+            f"line_spacing={line_spacing}, targets={use_font_color}/{use_font_size}/{use_bg_color}/{use_font_spacing}/{use_line_spacing}"
+        )
         self._restore_dialog_after_detect(disable_ms=0)
         self.button_box.setEnabled(False)
         self.adaptive_btn.setEnabled(False)
@@ -344,6 +413,10 @@ class SettingsDialog(QtWidgets.QDialog):
             result_lines.append(f"字体颜色：{font_hex}")
         if use_font_size and font_size is not None:
             result_lines.append(f"建议字号：{font_size}pt")
+        if use_font_spacing and font_spacing is not None:
+            result_lines.append(f"建议字距：{font_spacing:.0f}px")
+        if use_line_spacing and line_spacing is not None:
+            result_lines.append(f"建议行距：{int(round(line_spacing * 100))}%")
         result_lines.append("\n是否应用到当前设置？")
         msg.setText("\n".join(result_lines))
         yes_button = msg.addButton("应用", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
@@ -362,6 +435,10 @@ class SettingsDialog(QtWidgets.QDialog):
                     self.font_color = font_hex
                 if use_font_size and font_size is not None:
                     self.font_size = font_size
+                if use_font_spacing and font_spacing is not None:
+                    self.font_spacing = font_spacing
+                if use_line_spacing and line_spacing is not None:
+                    self.line_spacing = line_spacing
                 self._sync_controls()
                 self._save_current_settings()
                 self.status_label.setText("已应用并保存识别结果")
@@ -391,16 +468,21 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config_data["font_color"] = self.font_color
         self.config_data["bg_color"] = self.bg_color
         self.config_data["font_alpha"] = self.font_alpha
+        self.config_data["font_spacing"] = self.font_spacing
+        self.config_data["line_spacing"] = self.line_spacing
         self.config_data["bg_alpha"] = self.bg_alpha
         self.config_data["adaptive_targets"] = {
             "font_color": self.adaptive_font_color_check.isChecked(),
             "font_size": self.adaptive_font_size_check.isChecked(),
             "bg_color": self.adaptive_bg_color_check.isChecked(),
+            "font_spacing": self.adaptive_font_spacing_check.isChecked(),
+            "line_spacing": self.adaptive_line_spacing_check.isChecked(),
         }
         save_config_data(self.config_data)
         self._debug(
             f"即时保存设置 font={self.font_family}/{self.font_size}, font_color={self.font_color}, "
-            f"bg_color={self.bg_color}, font_alpha={self.font_alpha}, bg_alpha={self.bg_alpha}"
+            f"bg_color={self.bg_color}, font_alpha={self.font_alpha}, bg_alpha={self.bg_alpha}, "
+            f"font_spacing={self.font_spacing}, line_spacing={self.line_spacing}"
         )
 
     def _capture_region_image(self, rect: QtCore.QRect) -> QtGui.QImage | None:
@@ -509,6 +591,95 @@ class SettingsDialog(QtWidgets.QDialog):
         estimate_pt = int(round(px_height * 0.72))
         return max(10, min(42, estimate_pt))
 
+    def _estimate_font_spacing(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> float | None:
+        w = image.width()
+        h = image.height()
+        if w < 20 or h < 10:
+            return None
+        bg = QtGui.QColor(bg_hex)
+        fg = QtGui.QColor(font_hex)
+        bg_rgb = (bg.red(), bg.green(), bg.blue())
+        fg_rgb = (fg.red(), fg.green(), fg.blue())
+        step_y = max(1, h // 45)
+        gap_values: list[int] = []
+        for y in range(0, h, step_y):
+            run = 0
+            gaps: list[int] = []
+            in_text = False
+            for x in range(w):
+                c = QtGui.QColor(image.pixel(x, y))
+                rgb = (c.red(), c.green(), c.blue())
+                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
+                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
+                is_text = to_fg < to_bg and to_fg < 16000
+                if is_text:
+                    if not in_text and run > 0:
+                        gaps.append(run)
+                    in_text = True
+                    run = 0
+                else:
+                    if in_text:
+                        run = 1
+                    elif run > 0:
+                        run += 1
+                    in_text = False
+            compact_gaps = [g for g in gaps if 1 <= g <= 14]
+            if len(compact_gaps) >= 3:
+                gap_values.extend(compact_gaps)
+        if not gap_values:
+            return None
+        gap_values.sort()
+        baseline_gap = gap_values[len(gap_values) // 4]
+        spacing = max(0.0, float(baseline_gap - 1))
+        return min(20.0, spacing)
+
+    def _estimate_line_spacing(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> float | None:
+        w = image.width()
+        h = image.height()
+        if w < 20 or h < 20:
+            return None
+        bg = QtGui.QColor(bg_hex)
+        fg = QtGui.QColor(font_hex)
+        bg_rgb = (bg.red(), bg.green(), bg.blue())
+        fg_rgb = (fg.red(), fg.green(), fg.blue())
+        row_text_counts: list[int] = []
+        for y in range(h):
+            text_count = 0
+            for x in range(0, w, max(1, w // 220)):
+                c = QtGui.QColor(image.pixel(x, y))
+                rgb = (c.red(), c.green(), c.blue())
+                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
+                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
+                if to_fg < to_bg and to_fg < 16000:
+                    text_count += 1
+            row_text_counts.append(text_count)
+        active_rows = [i for i, count in enumerate(row_text_counts) if count >= 2]
+        if len(active_rows) < 8:
+            return None
+        text_runs: list[int] = []
+        gap_runs: list[int] = []
+        start = active_rows[0]
+        prev = active_rows[0]
+        for idx in active_rows[1:]:
+            if idx == prev + 1:
+                prev = idx
+                continue
+            text_runs.append(prev - start + 1)
+            gap_runs.append(idx - prev - 1)
+            start = idx
+            prev = idx
+        text_runs.append(prev - start + 1)
+        text_runs = [run for run in text_runs if run >= 2]
+        gap_runs = [gap for gap in gap_runs if gap >= 1]
+        if not text_runs or not gap_runs:
+            return None
+        text_runs.sort()
+        gap_runs.sort()
+        text_height = text_runs[len(text_runs) // 2]
+        gap_height = gap_runs[len(gap_runs) // 2]
+        line_spacing = (text_height + gap_height) / max(1, text_height)
+        return min(2.2, max(1.0, float(line_spacing)))
+
     def _rgb_distance_sq(self, a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
         dr = a[0] - b[0]
         dg = a[1] - b[1]
@@ -522,6 +693,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self._debug(f"触发设置弹窗accept，sender={type(self.sender()).__name__ if self.sender() else 'None'}")
         self.font_alpha = float(self.font_alpha_combo.currentData())
         self.bg_alpha = float(self.bg_alpha_combo.currentData())
+        self.font_spacing = float(self.font_spacing_slider.value())
+        self.line_spacing = max(1.0, self.line_spacing_slider.value() / 100.0)
         self._save_current_settings()
         super().accept()
 

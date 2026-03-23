@@ -45,6 +45,8 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.font_size = 18
         self.font_color = "#000000"
         self.font_alpha = 1.0
+        self.font_spacing = 0.0
+        self.line_spacing = 1.0
         self.bg_color = "#F2F2F2"
         self.alpha = 1.0
         self.borderless = True
@@ -81,6 +83,10 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.font_size = int(self.config_data.get("font_size", self.font_size))
         self.font_color = self.config_data.get("font_color", self.font_color)
         self.font_alpha = float(self.config_data.get("font_alpha", self.font_alpha))
+        self.font_spacing = float(self.config_data.get("font_spacing", self.font_spacing))
+        self.line_spacing = float(self.config_data.get("line_spacing", self.line_spacing))
+        self.font_spacing = min(20.0, max(0.0, self.font_spacing))
+        self.line_spacing = min(2.2, max(1.0, self.line_spacing))
         self.bg_color = self.config_data.get("bg_color", self.bg_color)
         self.alpha = float(self.config_data.get("bg_alpha", self.alpha))
 
@@ -121,6 +127,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.setAttribute(widget_attribute("WA_TransparentForMouseEvents"), False)
 
         # 4. 初始化样式和属性（不调用 show）
+        self._restore_window_geometry()
         self.apply_style()
         self.apply_anti_capture()
 
@@ -157,6 +164,8 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.config_data["font_size"] = self.font_size
         self.config_data["font_color"] = self.font_color
         self.config_data["font_alpha"] = self.font_alpha
+        self.config_data["font_spacing"] = self.font_spacing
+        self.config_data["line_spacing"] = self.line_spacing
         self.config_data["bg_color"] = self.bg_color
         self.config_data["bg_alpha"] = self.alpha
         self._save_config_data()
@@ -182,6 +191,43 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.config_data["recent_paths"] = normalized_recent[:20]
         self.last_open_path = path
         self._save_config_data()
+
+    def _save_window_geometry(self) -> None:
+        rect = self.normalGeometry() if (self.isMinimized() or self.isMaximized()) else self.geometry()
+        if rect.width() < 360 or rect.height() < 240:
+            return
+        self.config_data["window_geometry"] = {
+            "x": int(rect.x()),
+            "y": int(rect.y()),
+            "w": int(rect.width()),
+            "h": int(rect.height()),
+        }
+        self._save_config_data()
+
+    def _restore_window_geometry(self) -> None:
+        geometry_data = self.config_data.get("window_geometry")
+        if not isinstance(geometry_data, dict):
+            return
+        try:
+            x = int(geometry_data.get("x"))
+            y = int(geometry_data.get("y"))
+            w = int(geometry_data.get("w"))
+            h = int(geometry_data.get("h"))
+        except Exception:
+            return
+        if w < 360 or h < 240:
+            return
+        rect = QtCore.QRect(x, y, w, h)
+        screen = QtGui.QGuiApplication.screenAt(rect.center()) or QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            self.setGeometry(rect)
+            return
+        available = screen.availableGeometry()
+        w = min(w, available.width())
+        h = min(h, available.height())
+        x = min(max(x, available.left()), available.right() - w + 1)
+        y = min(max(y, available.top()), available.bottom() - h + 1)
+        self.setGeometry(x, y, w, h)
 
     def _load_shortcut_text(self, action: str, default_value: str) -> str:
         shortcuts = self.config_data.get("shortcuts", {})
@@ -231,6 +277,8 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def apply_style(self) -> None:
         font = QtGui.QFont(self.font_family, self.font_size)
+        spacing_type = QtGui.QFont.SpacingType.AbsoluteSpacing if PYQT6 else QtGui.QFont.AbsoluteSpacing
+        font.setLetterSpacing(spacing_type, self.font_spacing)
         self.text.setFont(font)
         
         c = QtGui.QColor(self.bg_color)
@@ -252,6 +300,16 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.text.setStyleSheet(f"QTextEdit {{ background-color: {rgba_color}; color: {font_rgba}; border: 0px; }}")
         self.text.setViewportMargins(0, 0, 0, 0)
         self.text.document().setDocumentMargin(0)
+        self._apply_text_spacing_format()
+
+    def _apply_text_spacing_format(self) -> None:
+        cursor = QtGui.QTextCursor(self.text.document())
+        selection_type = QtGui.QTextCursor.SelectionType.Document if PYQT6 else QtGui.QTextCursor.Document
+        cursor.select(selection_type)
+        block_format = QtGui.QTextBlockFormat()
+        line_height_type = QtGui.QTextBlockFormat.LineHeightTypes.ProportionalHeight if PYQT6 else QtGui.QTextBlockFormat.ProportionalHeight
+        block_format.setLineHeight(int(round(self.line_spacing * 100)), line_height_type)
+        cursor.mergeBlockFormat(block_format)
 
     def apply_opacity(self) -> None:
         wa_translucent = widget_attribute("WA_TranslucentBackground")
@@ -308,6 +366,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
         current_chapter_text = self.chapters[self.chapter_index]["text"]
         if self.text.toPlainText() != current_chapter_text:
             self.text.setPlainText(current_chapter_text)
+            self._apply_text_spacing_format()
 
         if restore_scroll is not None:
             self.text.verticalScrollBar().setValue(restore_scroll)
@@ -376,7 +435,9 @@ class ReaderWindow(QtWidgets.QMainWindow):
         use_font_color = bool(adaptive_targets.get("font_color", True)) if isinstance(adaptive_targets, dict) else True
         use_font_size = bool(adaptive_targets.get("font_size", True)) if isinstance(adaptive_targets, dict) else True
         use_bg_color = bool(adaptive_targets.get("bg_color", True)) if isinstance(adaptive_targets, dict) else True
-        if not (use_font_color or use_font_size or use_bg_color):
+        use_font_spacing = bool(adaptive_targets.get("font_spacing", False)) if isinstance(adaptive_targets, dict) else False
+        use_line_spacing = bool(adaptive_targets.get("line_spacing", False)) if isinstance(adaptive_targets, dict) else False
+        if not (use_font_color or use_font_size or use_bg_color or use_font_spacing or use_line_spacing):
             QtWidgets.QMessageBox.information(self, "自适应识别", "请先在首页阅读设置里至少勾选一个识别项")
             return
         prev_anti_capture = self.anti_capture
@@ -406,6 +467,8 @@ class ReaderWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "自适应识别", "识别失败：未能提取有效颜色")
             return
         font_size = self._estimate_font_size(image, bg_hex, font_hex) if use_font_size else None
+        font_spacing = self._estimate_font_spacing(image, bg_hex, font_hex) if use_font_spacing else None
+        line_spacing = self._estimate_line_spacing(image, bg_hex, font_hex) if use_line_spacing else None
         result_lines = ["识别完成："]
         if use_bg_color:
             result_lines.append(f"背景色：{bg_hex}")
@@ -413,6 +476,10 @@ class ReaderWindow(QtWidgets.QMainWindow):
             result_lines.append(f"字体颜色：{font_hex}")
         if use_font_size and font_size is not None:
             result_lines.append(f"建议字号：{font_size}pt")
+        if use_font_spacing and font_spacing is not None:
+            result_lines.append(f"建议字距：{font_spacing:.0f}px")
+        if use_line_spacing and line_spacing is not None:
+            result_lines.append(f"建议行距：{int(round(line_spacing * 100))}%")
         result_lines.append("\n是否应用到当前界面？")
         ask = QtWidgets.QMessageBox.question(
             self,
@@ -431,6 +498,10 @@ class ReaderWindow(QtWidgets.QMainWindow):
                 self.font_color = font_hex
             if use_font_size and font_size is not None:
                 self.font_size = font_size
+            if use_font_spacing and font_spacing is not None:
+                self.font_spacing = font_spacing
+            if use_line_spacing and line_spacing is not None:
+                self.line_spacing = line_spacing
             self.apply_style()
             self._save_settings()
             QtWidgets.QMessageBox.information(self, "自适应识别", "已应用识别结果")
@@ -541,6 +612,95 @@ class ReaderWindow(QtWidgets.QMainWindow):
         estimate_pt = int(round(px_height * 0.72))
         return max(10, min(42, estimate_pt))
 
+    def _estimate_font_spacing(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> float | None:
+        w = image.width()
+        h = image.height()
+        if w < 20 or h < 10:
+            return None
+        bg = QtGui.QColor(bg_hex)
+        fg = QtGui.QColor(font_hex)
+        bg_rgb = (bg.red(), bg.green(), bg.blue())
+        fg_rgb = (fg.red(), fg.green(), fg.blue())
+        step_y = max(1, h // 45)
+        gap_values: list[int] = []
+        for y in range(0, h, step_y):
+            run = 0
+            gaps: list[int] = []
+            in_text = False
+            for x in range(w):
+                c = QtGui.QColor(image.pixel(x, y))
+                rgb = (c.red(), c.green(), c.blue())
+                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
+                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
+                is_text = to_fg < to_bg and to_fg < 16000
+                if is_text:
+                    if not in_text and run > 0:
+                        gaps.append(run)
+                    in_text = True
+                    run = 0
+                else:
+                    if in_text:
+                        run = 1
+                    elif run > 0:
+                        run += 1
+                    in_text = False
+            compact_gaps = [g for g in gaps if 1 <= g <= 14]
+            if len(compact_gaps) >= 3:
+                gap_values.extend(compact_gaps)
+        if not gap_values:
+            return None
+        gap_values.sort()
+        baseline_gap = gap_values[len(gap_values) // 4]
+        spacing = max(0.0, float(baseline_gap - 1))
+        return min(20.0, spacing)
+
+    def _estimate_line_spacing(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> float | None:
+        w = image.width()
+        h = image.height()
+        if w < 20 or h < 20:
+            return None
+        bg = QtGui.QColor(bg_hex)
+        fg = QtGui.QColor(font_hex)
+        bg_rgb = (bg.red(), bg.green(), bg.blue())
+        fg_rgb = (fg.red(), fg.green(), fg.blue())
+        row_text_counts: list[int] = []
+        for y in range(h):
+            text_count = 0
+            for x in range(0, w, max(1, w // 220)):
+                c = QtGui.QColor(image.pixel(x, y))
+                rgb = (c.red(), c.green(), c.blue())
+                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
+                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
+                if to_fg < to_bg and to_fg < 16000:
+                    text_count += 1
+            row_text_counts.append(text_count)
+        active_rows = [i for i, count in enumerate(row_text_counts) if count >= 2]
+        if len(active_rows) < 8:
+            return None
+        text_runs: list[int] = []
+        gap_runs: list[int] = []
+        start = active_rows[0]
+        prev = active_rows[0]
+        for idx in active_rows[1:]:
+            if idx == prev + 1:
+                prev = idx
+                continue
+            text_runs.append(prev - start + 1)
+            gap_runs.append(idx - prev - 1)
+            start = idx
+            prev = idx
+        text_runs.append(prev - start + 1)
+        text_runs = [run for run in text_runs if run >= 2]
+        gap_runs = [gap for gap in gap_runs if gap >= 1]
+        if not text_runs or not gap_runs:
+            return None
+        text_runs.sort()
+        gap_runs.sort()
+        text_height = text_runs[len(text_runs) // 2]
+        gap_height = gap_runs[len(gap_runs) // 2]
+        line_spacing = (text_height + gap_height) / max(1, text_height)
+        return min(2.2, max(1.0, float(line_spacing)))
+
     def _rgb_distance_sq(self, a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
         dr = a[0] - b[0]
         dg = a[1] - b[1]
@@ -552,18 +712,44 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def back_to_home(self) -> None:
         if callable(self.on_back_home):
+            self._save_window_geometry()
             self.close()
             self.on_back_home()
+
+    def open_settings_dialog(self) -> None:
+        try:
+            from main import SettingsDialog
+        except Exception:
+            QtWidgets.QMessageBox.warning(self, "阅读设置", "无法打开阅读设置弹窗")
+            return
+        dialog = SettingsDialog(self)
+        if PYQT6:
+            accepted = dialog.exec()
+        else:
+            accepted = dialog.exec_()
+        if not accepted:
+            return
+        self.config_data = self._load_config_data()
+        self.font_family = self.config_data.get("font_family", self.font_family)
+        self.font_size = int(self.config_data.get("font_size", self.font_size))
+        self.font_color = self.config_data.get("font_color", self.font_color)
+        self.font_alpha = float(self.config_data.get("font_alpha", self.font_alpha))
+        self.font_spacing = float(self.config_data.get("font_spacing", self.font_spacing))
+        self.line_spacing = float(self.config_data.get("line_spacing", self.line_spacing))
+        self.font_spacing = min(20.0, max(0.0, self.font_spacing))
+        self.line_spacing = min(2.2, max(1.0, self.line_spacing))
+        self.bg_color = self.config_data.get("bg_color", self.bg_color)
+        self.alpha = float(self.config_data.get("bg_alpha", self.alpha))
+        self.apply_style()
+        self._save_settings()
 
     def show_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
         menu.addAction("打开文件", self.open_file)
         menu.addAction("章节跳转", self.jump_to_chapter)
         menu.addSeparator()
-        menu.addAction("上一页", self.prev_page)
-        menu.addAction("下一页", self.next_page)
+        menu.addAction("阅读设置", self.open_settings_dialog)
         menu.addSeparator()
-        menu.addAction("自适应识别", self.adaptive_detect_style)
         back_action = menu.addAction("返回首页")
         back_action.triggered.connect(self.back_to_home)
         if not callable(self.on_back_home):
@@ -902,7 +1088,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
     def get_line_height(self) -> int:
         font = self.text.currentFont()
         metrics = QtGui.QFontMetrics(font)
-        return max(1, metrics.lineSpacing())
+        return max(1, int(round(metrics.lineSpacing() * self.line_spacing)))
 
     def snap_to_line(self) -> None:
         bar = self.text.verticalScrollBar()
@@ -917,6 +1103,10 @@ class ReaderWindow(QtWidgets.QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.snap_to_line()
+
+    def closeEvent(self, event) -> None:
+        self._save_window_geometry()
+        super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:
         super().keyPressEvent(event)
