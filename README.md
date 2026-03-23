@@ -68,7 +68,7 @@ python main.py --file "D:\path\to\book.epub"
 ## 打包为 EXE
 使用 PyInstaller（需已安装）：
 ```bash
-pyinstaller --name "EpubReader" --onefile --windowed app.py
+pyinstaller --name "EpubReader" --onefile --windowed --icon ico/yu.ico app.py
 ```
 发布建议：
 - 将生成的 `dist/EpubReader.exe` 与一个 `reader_config.json` 放入 `Release/` 目录后分发

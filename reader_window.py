@@ -5,6 +5,7 @@ import os
 import pathlib
 import bisect
 import sys
+from collections import defaultdict
 
 from epub_utils import parse_epub_chapters, read_text_with_fallback
 from qt_compat import (
@@ -26,10 +27,11 @@ from qt_compat import (
 
 
 class ReaderWindow(QtWidgets.QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, on_back_home=None) -> None:
         super().__init__()
         self.setWindowTitle("简易阅读器")
         self.setGeometry(100, 100, 900, 600)
+        self.on_back_home = on_back_home
 
         self.content = ""
         self.chapters: list[dict[str, str]] = []
@@ -45,7 +47,6 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.font_alpha = 1.0
         self.bg_color = "#F2F2F2"
         self.alpha = 1.0
-        self.always_on_top = False
         self.borderless = True
         self.anti_capture = True
 
@@ -72,6 +73,10 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.config_path = self.base_path / "reader_config.json"
         self.config_data = self._load_config_data()
         self.last_open_path = self.config_data.get("last_path", "")
+        self.page_prev_shortcut_text = self._load_shortcut_text("prev_page", "A")
+        self.page_next_shortcut_text = self._load_shortcut_text("next_page", "D")
+        self.toggle_visible_shortcut_text = self._load_shortcut_text("toggle_visible", "Alt+V")
+        self.close_app_shortcut_text = self._load_shortcut_text("close_app", "Alt+Esc")
         self.font_family = self.config_data.get("font_family", self.font_family)
         self.font_size = int(self.config_data.get("font_size", self.font_size))
         self.font_color = self.config_data.get("font_color", self.font_color)
@@ -101,6 +106,8 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.setMouseTracking(True)
         self.text.setMouseTracking(True)
         self.text.viewport().setMouseTracking(True)
+        self._runtime_shortcuts: list[QtGui.QShortcut] = []
+        self._setup_runtime_shortcuts()
 
         # 1. 先设置无边框标志，这对 WA_TranslucentBackground 很重要
         if self.borderless:
@@ -116,10 +123,6 @@ class ReaderWindow(QtWidgets.QMainWindow):
         # 4. 初始化样式和属性（不调用 show）
         self.apply_style()
         self.apply_anti_capture()
-        
-        # 4. 如果需要在最顶层
-        if self.always_on_top:
-            self.setWindowFlag(window_flag("WindowStaysOnTopHint"), True)
 
     def _load_progress_data(self) -> dict:
         try:
@@ -145,7 +148,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def _save_config_data(self) -> None:
         try:
-            self.config_path.write_text(json.dumps(self.config_data, ensure_ascii=False), encoding="utf-8")
+            self.config_path.write_text(json.dumps(self.config_data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -160,8 +163,60 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def _remember_last_path(self, path: str) -> None:
         self.config_data["last_path"] = path
+        recent_paths = self.config_data.get("recent_paths", [])
+        if not isinstance(recent_paths, list):
+            recent_paths = []
+        normalized_recent = []
+        for p in recent_paths:
+            if not isinstance(p, str):
+                continue
+            try:
+                normalized = str(pathlib.Path(p).expanduser().resolve())
+            except Exception:
+                continue
+            if normalized not in normalized_recent:
+                normalized_recent.append(normalized)
+        if path in normalized_recent:
+            normalized_recent.remove(path)
+        normalized_recent.insert(0, path)
+        self.config_data["recent_paths"] = normalized_recent[:20]
         self.last_open_path = path
         self._save_config_data()
+
+    def _load_shortcut_text(self, action: str, default_value: str) -> str:
+        shortcuts = self.config_data.get("shortcuts", {})
+        action_value = shortcuts.get(action) if isinstance(shortcuts, dict) else None
+        if isinstance(action_value, str) and action_value.strip():
+            return action_value.strip()
+        return default_value
+
+    def _setup_runtime_shortcuts(self) -> None:
+        self._runtime_shortcuts.clear()
+        context = QtCore.Qt.ShortcutContext.ApplicationShortcut if PYQT6 else QtCore.Qt.ApplicationShortcut
+        bindings = [
+            (self.page_prev_shortcut_text, self.prev_page),
+            (self.page_next_shortcut_text, self.next_page),
+            (self.toggle_visible_shortcut_text, self._toggle_visibility),
+            (self.close_app_shortcut_text, self.close),
+        ]
+        if self.close_app_shortcut_text.strip().lower() == "alt+esc":
+            bindings.append(("Alt+Q", self.close))
+        for key_text, handler in bindings:
+            sequence = QtGui.QKeySequence(key_text)
+            if sequence.count() <= 0:
+                continue
+            shortcut = QtWidgets.QShortcut(sequence, self)
+            shortcut.setContext(context)
+            shortcut.activated.connect(handler)
+            self._runtime_shortcuts.append(shortcut)
+
+    def _toggle_visibility(self) -> None:
+        if self.isMinimized() or not self.isVisible():
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        else:
+            self.showMinimized()
 
     def load_last_file(self) -> None:
         if not self.last_open_path:
@@ -213,11 +268,6 @@ class ReaderWindow(QtWidgets.QMainWindow):
                 self.setAttribute(wa_translucent, False)
                 self.show()
             self.apply_style()
-
-    def apply_topmost(self) -> None:
-        self.setWindowFlag(window_flag("WindowStaysOnTopHint"), self.always_on_top)
-        if self.isVisible():
-            self.show()
 
     def apply_borderless(self) -> None:
         self.setWindowFlag(window_flag("FramelessWindowHint"), self.borderless)
@@ -306,10 +356,6 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.apply_style()
         self._save_settings()
 
-    def toggle_topmost(self, checked: bool) -> None:
-        self.always_on_top = checked
-        self.apply_topmost()
-
     def toggle_anti_capture(self, checked: bool) -> None:
         self.anti_capture = checked
         self.apply_anti_capture()
@@ -324,6 +370,191 @@ class ReaderWindow(QtWidgets.QMainWindow):
             self.chapter_index = items.index(item)
             self.update_view()
 
+    def adaptive_detect_style(self) -> None:
+        self.config_data = self._load_config_data()
+        adaptive_targets = self.config_data.get("adaptive_targets", {})
+        use_font_color = bool(adaptive_targets.get("font_color", True)) if isinstance(adaptive_targets, dict) else True
+        use_font_size = bool(adaptive_targets.get("font_size", True)) if isinstance(adaptive_targets, dict) else True
+        use_bg_color = bool(adaptive_targets.get("bg_color", True)) if isinstance(adaptive_targets, dict) else True
+        if not (use_font_color or use_font_size or use_bg_color):
+            QtWidgets.QMessageBox.information(self, "自适应识别", "请先在首页阅读设置里至少勾选一个识别项")
+            return
+        prev_anti_capture = self.anti_capture
+        if prev_anti_capture:
+            self.anti_capture = False
+            self.apply_anti_capture()
+        self.hide()
+        QtWidgets.QApplication.processEvents()
+        selector = RegionSelectionOverlay(self)
+        selected_rect = selector.select_region()
+        if selected_rect is None:
+            if prev_anti_capture:
+                self.anti_capture = True
+                self.apply_anti_capture()
+            self.show()
+            return
+        image = self._capture_region_image(selected_rect)
+        if prev_anti_capture:
+            self.anti_capture = True
+            self.apply_anti_capture()
+        self.show()
+        if image is None or image.isNull():
+            QtWidgets.QMessageBox.warning(self, "自适应识别", "识别失败：无法获取圈选区域图像")
+            return
+        bg_hex, font_hex = self._detect_style_colors(image)
+        if bg_hex is None or font_hex is None:
+            QtWidgets.QMessageBox.warning(self, "自适应识别", "识别失败：未能提取有效颜色")
+            return
+        font_size = self._estimate_font_size(image, bg_hex, font_hex) if use_font_size else None
+        result_lines = ["识别完成："]
+        if use_bg_color:
+            result_lines.append(f"背景色：{bg_hex}")
+        if use_font_color:
+            result_lines.append(f"字体颜色：{font_hex}")
+        if use_font_size and font_size is not None:
+            result_lines.append(f"建议字号：{font_size}pt")
+        result_lines.append("\n是否应用到当前界面？")
+        ask = QtWidgets.QMessageBox.question(
+            self,
+            "确认应用识别结果",
+            "\n".join(result_lines),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            if PYQT6
+            else QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.StandardButton.Yes if PYQT6 else QtWidgets.QMessageBox.Yes,
+        )
+        yes_btn = QtWidgets.QMessageBox.StandardButton.Yes if PYQT6 else QtWidgets.QMessageBox.Yes
+        if ask == yes_btn:
+            if use_bg_color:
+                self.bg_color = bg_hex
+            if use_font_color:
+                self.font_color = font_hex
+            if use_font_size and font_size is not None:
+                self.font_size = font_size
+            self.apply_style()
+            self._save_settings()
+            QtWidgets.QMessageBox.information(self, "自适应识别", "已应用识别结果")
+
+    def _capture_region_image(self, rect: QtCore.QRect) -> QtGui.QImage | None:
+        if rect.width() <= 1 or rect.height() <= 1:
+            return None
+        center = rect.center()
+        screen = QtGui.QGuiApplication.screenAt(center)
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return None
+        geo = screen.geometry()
+        x = rect.x() - geo.x()
+        y = rect.y() - geo.y()
+        pixmap = screen.grabWindow(0, x, y, rect.width(), rect.height())
+        if pixmap.isNull():
+            return None
+        return pixmap.toImage()
+
+    def _detect_style_colors(self, image: QtGui.QImage) -> tuple[str | None, str | None]:
+        w = image.width()
+        h = image.height()
+        if w <= 0 or h <= 0:
+            return None, None
+        max_samples = 60000
+        step = max(1, int(((w * h) / max_samples) ** 0.5))
+        bins: dict[tuple[int, int, int], int] = {}
+        sums: dict[tuple[int, int, int], list[int]] = defaultdict(lambda: [0, 0, 0, 0])
+        total = 0
+        for y in range(0, h, step):
+            for x in range(0, w, step):
+                color = QtGui.QColor(image.pixel(x, y))
+                if color.alpha() < 10:
+                    continue
+                r, g, b = color.red(), color.green(), color.blue()
+                key_bin = (r // 16, g // 16, b // 16)
+                bins[key_bin] = bins.get(key_bin, 0) + 1
+                data = sums[key_bin]
+                data[0] += r
+                data[1] += g
+                data[2] += b
+                data[3] += 1
+                total += 1
+        if total == 0 or not bins:
+            return None, None
+        sorted_bins = sorted(bins.items(), key=lambda item: item[1], reverse=True)
+        bg_bin = sorted_bins[0][0]
+        bg_rgb = self._avg_rgb_from_bin(bg_bin, sums)
+        bg_luma = self._luminance(*bg_rgb)
+        font_rgb = None
+        best_score = -1.0
+        for key_bin, count in sorted_bins[1:20]:
+            rgb = self._avg_rgb_from_bin(key_bin, sums)
+            contrast = abs(self._luminance(*rgb) - bg_luma)
+            score = contrast * ((count / total) ** 0.35)
+            if contrast >= 35 and score > best_score:
+                font_rgb = rgb
+                best_score = score
+        if font_rgb is None:
+            if bg_luma >= 140:
+                font_rgb = (0, 0, 0)
+            else:
+                font_rgb = (255, 255, 255)
+        bg_hex = "#{:02x}{:02x}{:02x}".format(*bg_rgb)
+        font_hex = "#{:02x}{:02x}{:02x}".format(*font_rgb)
+        if bg_hex == font_hex:
+            font_hex = "#000000" if self._luminance(*bg_rgb) >= 128 else "#ffffff"
+        return bg_hex, font_hex
+
+    def _avg_rgb_from_bin(self, key_bin: tuple[int, int, int], sums: dict[tuple[int, int, int], list[int]]) -> tuple[int, int, int]:
+        data = sums[key_bin]
+        count = max(1, data[3])
+        return (data[0] // count, data[1] // count, data[2] // count)
+
+    def _estimate_font_size(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> int | None:
+        w = image.width()
+        h = image.height()
+        if w < 10 or h < 10:
+            return None
+        bg = QtGui.QColor(bg_hex)
+        fg = QtGui.QColor(font_hex)
+        bg_rgb = (bg.red(), bg.green(), bg.blue())
+        fg_rgb = (fg.red(), fg.green(), fg.blue())
+        step_x = max(1, w // 120)
+        runs: list[int] = []
+        for x in range(0, w, step_x):
+            run = 0
+            for y in range(h):
+                c = QtGui.QColor(image.pixel(x, y))
+                rgb = (c.red(), c.green(), c.blue())
+                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
+                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
+                is_text = to_fg < to_bg and to_fg < 16000
+                if is_text:
+                    run += 1
+                else:
+                    if 4 <= run <= 120:
+                        runs.append(run)
+                    run = 0
+            if 4 <= run <= 120:
+                runs.append(run)
+        if not runs:
+            return None
+        runs.sort()
+        px_height = runs[len(runs) // 2]
+        estimate_pt = int(round(px_height * 0.72))
+        return max(10, min(42, estimate_pt))
+
+    def _rgb_distance_sq(self, a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
+        dr = a[0] - b[0]
+        dg = a[1] - b[1]
+        db = a[2] - b[2]
+        return dr * dr + dg * dg + db * db
+
+    def _luminance(self, r: int, g: int, b: int) -> float:
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    def back_to_home(self) -> None:
+        if callable(self.on_back_home):
+            self.close()
+            self.on_back_home()
+
     def show_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
         menu.addAction("打开文件", self.open_file)
@@ -332,23 +563,11 @@ class ReaderWindow(QtWidgets.QMainWindow):
         menu.addAction("上一页", self.prev_page)
         menu.addAction("下一页", self.next_page)
         menu.addSeparator()
-        menu.addAction("字体设置", self.open_font_dialog)
-        menu.addAction("字体颜色", self.pick_font_color)
-        font_opacity_menu = menu.addMenu("字体透明度")
-        for val in (0.0, 0.1, 0.3, 0.5, 0.7, 0.85, 1.0):
-            font_opacity_menu.addAction(f"{int(val * 100)}%", lambda v=val: self.set_font_opacity(v))
-        menu.addAction("背景色", self.pick_bg)
-        opacity_menu = menu.addMenu("背景透明度")
-        zero_action = opacity_menu.addAction("0% (仅文字)", lambda: self.set_opacity(0.0))
-        if not self.chapters:
-            zero_action.setEnabled(False)
-            
-        for val in (0.3, 0.5, 0.7, 0.85, 1.0):
-            opacity_menu.addAction(f"{int(val * 100)}%", lambda v=val: self.set_opacity(v))
-        top_action = menu.addAction("置顶")
-        top_action.setCheckable(True)
-        top_action.setChecked(self.always_on_top)
-        top_action.toggled.connect(self.toggle_topmost)
+        menu.addAction("自适应识别", self.adaptive_detect_style)
+        back_action = menu.addAction("返回首页")
+        back_action.triggered.connect(self.back_to_home)
+        if not callable(self.on_back_home):
+            back_action.setEnabled(False)
         anti_action = menu.addAction("防截屏")
         anti_action.setCheckable(True)
         anti_action.setChecked(self.anti_capture)
@@ -700,10 +919,69 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.snap_to_line()
 
     def keyPressEvent(self, event) -> None:
-        if event.key() in (key("Key_A"), key("Key_PageUp")):
-            self.prev_page()
+        super().keyPressEvent(event)
+
+
+class RegionSelectionOverlay(QtWidgets.QWidget):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._origin = QtCore.QPoint()
+        self._selected_rect: QtCore.QRect | None = None
+        self._loop = QtCore.QEventLoop(self)
+        shape = QtWidgets.QRubberBand.Shape.Rectangle if PYQT6 else QtWidgets.QRubberBand.Rectangle
+        self._rubber_band = QtWidgets.QRubberBand(shape, self)
+        flags = window_flag("FramelessWindowHint") | window_flag("WindowStaysOnTopHint") | window_flag("Tool")
+        self.setWindowFlags(flags)
+        self.setCursor(cursor_shape("CrossCursor"))
+        self.setWindowOpacity(0.25)
+        self.setStyleSheet("background-color: black;")
+        self._set_virtual_geometry()
+
+    def _set_virtual_geometry(self) -> None:
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
             return
-        if event.key() in (key("Key_D"), key("Key_PageDown")):
-            self.next_page()
+        geo = screen.virtualGeometry()
+        self.setGeometry(geo)
+
+    def select_region(self) -> QtCore.QRect | None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if PYQT6:
+            self._loop.exec()
+        else:
+            self._loop.exec_()
+        return self._selected_rect
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != mouse_button("LeftButton"):
+            return
+        self._origin = local_pos(event)
+        self._rubber_band.setGeometry(QtCore.QRect(self._origin, QtCore.QSize()))
+        self._rubber_band.show()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._rubber_band.isVisible():
+            self._rubber_band.setGeometry(QtCore.QRect(self._origin, local_pos(event)).normalized())
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != mouse_button("LeftButton"):
+            return
+        rect = self._rubber_band.geometry().normalized()
+        self._rubber_band.hide()
+        if rect.width() > 2 and rect.height() > 2:
+            top_left = self.geometry().topLeft()
+            self._selected_rect = QtCore.QRect(rect.topLeft() + top_left, rect.size())
+        else:
+            self._selected_rect = None
+        self.close()
+        self._loop.quit()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == key("Key_Escape"):
+            self._selected_rect = None
+            self.close()
+            self._loop.quit()
             return
         super().keyPressEvent(event)
