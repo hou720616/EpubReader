@@ -3,9 +3,6 @@ import ctypes.wintypes
 import json
 import os
 import pathlib
-import bisect
-import sys
-from collections import defaultdict
 
 from epub_utils import parse_epub_chapters, read_text_with_fallback
 from qt_compat import (
@@ -17,13 +14,22 @@ from qt_compat import (
     cursor_shape,
     event_type,
     global_pos,
-    key,
     local_pos,
     mouse_button,
     no_frame,
     window_flag,
     widget_attribute,
 )
+from services.config_service import load_config_data, save_config_data, update_recent_paths
+from services.style_detect_service import (
+    capture_region_image,
+    detect_style_colors,
+    estimate_font_size,
+    estimate_font_spacing,
+    estimate_line_spacing,
+)
+from ui.overlay import RegionSelectionOverlay
+from ui.settings_dialog import SettingsDialog
 
 
 class ReaderWindow(QtWidgets.QMainWindow):
@@ -63,16 +69,6 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
         self.progress_path = pathlib.Path.home() / ".epubrand_progress.json"
         self.progress_data = self._load_progress_data()
-        
-        # 适配打包后的路径
-        if getattr(sys, 'frozen', False):
-            # 如果是打包后的 EXE，配置文件放在 EXE 同级目录
-            self.base_path = pathlib.Path(sys.executable).parent
-        else:
-            # 开发环境，放在文件同级目录
-            self.base_path = pathlib.Path(__file__).resolve().parent
-
-        self.config_path = self.base_path / "reader_config.json"
         self.config_data = self._load_config_data()
         self.last_open_path = self.config_data.get("last_path", "")
         self.page_prev_shortcut_text = self._load_shortcut_text("prev_page", "A")
@@ -146,18 +142,10 @@ class ReaderWindow(QtWidgets.QMainWindow):
             pass
 
     def _load_config_data(self) -> dict:
-        try:
-            if self.config_path.exists():
-                return json.loads(self.config_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-        return {}
+        return load_config_data()
 
     def _save_config_data(self) -> None:
-        try:
-            self.config_path.write_text(json.dumps(self.config_data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        save_config_data(self.config_data)
 
     def _save_settings(self) -> None:
         self.config_data["font_family"] = self.font_family
@@ -171,24 +159,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self._save_config_data()
 
     def _remember_last_path(self, path: str) -> None:
-        self.config_data["last_path"] = path
-        recent_paths = self.config_data.get("recent_paths", [])
-        if not isinstance(recent_paths, list):
-            recent_paths = []
-        normalized_recent = []
-        for p in recent_paths:
-            if not isinstance(p, str):
-                continue
-            try:
-                normalized = str(pathlib.Path(p).expanduser().resolve())
-            except Exception:
-                continue
-            if normalized not in normalized_recent:
-                normalized_recent.append(normalized)
-        if path in normalized_recent:
-            normalized_recent.remove(path)
-        normalized_recent.insert(0, path)
-        self.config_data["recent_paths"] = normalized_recent[:20]
+        update_recent_paths(self.config_data, path)
         self.last_open_path = path
         self._save_config_data()
 
@@ -454,7 +425,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
                 self.apply_anti_capture()
             self.show()
             return
-        image = self._capture_region_image(selected_rect)
+        image = capture_region_image(selected_rect)
         if prev_anti_capture:
             self.anti_capture = True
             self.apply_anti_capture()
@@ -462,13 +433,13 @@ class ReaderWindow(QtWidgets.QMainWindow):
         if image is None or image.isNull():
             QtWidgets.QMessageBox.warning(self, "自适应识别", "识别失败：无法获取圈选区域图像")
             return
-        bg_hex, font_hex = self._detect_style_colors(image)
+        bg_hex, font_hex = detect_style_colors(image)
         if bg_hex is None or font_hex is None:
             QtWidgets.QMessageBox.warning(self, "自适应识别", "识别失败：未能提取有效颜色")
             return
-        font_size = self._estimate_font_size(image, bg_hex, font_hex) if use_font_size else None
-        font_spacing = self._estimate_font_spacing(image, bg_hex, font_hex) if use_font_spacing else None
-        line_spacing = self._estimate_line_spacing(image, bg_hex, font_hex) if use_line_spacing else None
+        font_size = estimate_font_size(image, bg_hex, font_hex) if use_font_size else None
+        font_spacing = estimate_font_spacing(image, bg_hex, font_hex) if use_font_spacing else None
+        line_spacing = estimate_line_spacing(image, bg_hex, font_hex) if use_line_spacing else None
         result_lines = ["识别完成："]
         if use_bg_color:
             result_lines.append(f"背景色：{bg_hex}")
@@ -506,210 +477,6 @@ class ReaderWindow(QtWidgets.QMainWindow):
             self._save_settings()
             QtWidgets.QMessageBox.information(self, "自适应识别", "已应用识别结果")
 
-    def _capture_region_image(self, rect: QtCore.QRect) -> QtGui.QImage | None:
-        if rect.width() <= 1 or rect.height() <= 1:
-            return None
-        center = rect.center()
-        screen = QtGui.QGuiApplication.screenAt(center)
-        if screen is None:
-            screen = QtGui.QGuiApplication.primaryScreen()
-        if screen is None:
-            return None
-        geo = screen.geometry()
-        x = rect.x() - geo.x()
-        y = rect.y() - geo.y()
-        pixmap = screen.grabWindow(0, x, y, rect.width(), rect.height())
-        if pixmap.isNull():
-            return None
-        return pixmap.toImage()
-
-    def _detect_style_colors(self, image: QtGui.QImage) -> tuple[str | None, str | None]:
-        w = image.width()
-        h = image.height()
-        if w <= 0 or h <= 0:
-            return None, None
-        max_samples = 60000
-        step = max(1, int(((w * h) / max_samples) ** 0.5))
-        bins: dict[tuple[int, int, int], int] = {}
-        sums: dict[tuple[int, int, int], list[int]] = defaultdict(lambda: [0, 0, 0, 0])
-        total = 0
-        for y in range(0, h, step):
-            for x in range(0, w, step):
-                color = QtGui.QColor(image.pixel(x, y))
-                if color.alpha() < 10:
-                    continue
-                r, g, b = color.red(), color.green(), color.blue()
-                key_bin = (r // 16, g // 16, b // 16)
-                bins[key_bin] = bins.get(key_bin, 0) + 1
-                data = sums[key_bin]
-                data[0] += r
-                data[1] += g
-                data[2] += b
-                data[3] += 1
-                total += 1
-        if total == 0 or not bins:
-            return None, None
-        sorted_bins = sorted(bins.items(), key=lambda item: item[1], reverse=True)
-        bg_bin = sorted_bins[0][0]
-        bg_rgb = self._avg_rgb_from_bin(bg_bin, sums)
-        bg_luma = self._luminance(*bg_rgb)
-        font_rgb = None
-        best_score = -1.0
-        for key_bin, count in sorted_bins[1:20]:
-            rgb = self._avg_rgb_from_bin(key_bin, sums)
-            contrast = abs(self._luminance(*rgb) - bg_luma)
-            score = contrast * ((count / total) ** 0.35)
-            if contrast >= 35 and score > best_score:
-                font_rgb = rgb
-                best_score = score
-        if font_rgb is None:
-            if bg_luma >= 140:
-                font_rgb = (0, 0, 0)
-            else:
-                font_rgb = (255, 255, 255)
-        bg_hex = "#{:02x}{:02x}{:02x}".format(*bg_rgb)
-        font_hex = "#{:02x}{:02x}{:02x}".format(*font_rgb)
-        if bg_hex == font_hex:
-            font_hex = "#000000" if self._luminance(*bg_rgb) >= 128 else "#ffffff"
-        return bg_hex, font_hex
-
-    def _avg_rgb_from_bin(self, key_bin: tuple[int, int, int], sums: dict[tuple[int, int, int], list[int]]) -> tuple[int, int, int]:
-        data = sums[key_bin]
-        count = max(1, data[3])
-        return (data[0] // count, data[1] // count, data[2] // count)
-
-    def _estimate_font_size(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> int | None:
-        w = image.width()
-        h = image.height()
-        if w < 10 or h < 10:
-            return None
-        bg = QtGui.QColor(bg_hex)
-        fg = QtGui.QColor(font_hex)
-        bg_rgb = (bg.red(), bg.green(), bg.blue())
-        fg_rgb = (fg.red(), fg.green(), fg.blue())
-        step_x = max(1, w // 120)
-        runs: list[int] = []
-        for x in range(0, w, step_x):
-            run = 0
-            for y in range(h):
-                c = QtGui.QColor(image.pixel(x, y))
-                rgb = (c.red(), c.green(), c.blue())
-                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
-                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
-                is_text = to_fg < to_bg and to_fg < 16000
-                if is_text:
-                    run += 1
-                else:
-                    if 4 <= run <= 120:
-                        runs.append(run)
-                    run = 0
-            if 4 <= run <= 120:
-                runs.append(run)
-        if not runs:
-            return None
-        runs.sort()
-        px_height = runs[len(runs) // 2]
-        estimate_pt = int(round(px_height * 0.72))
-        return max(10, min(42, estimate_pt))
-
-    def _estimate_font_spacing(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> float | None:
-        w = image.width()
-        h = image.height()
-        if w < 20 or h < 10:
-            return None
-        bg = QtGui.QColor(bg_hex)
-        fg = QtGui.QColor(font_hex)
-        bg_rgb = (bg.red(), bg.green(), bg.blue())
-        fg_rgb = (fg.red(), fg.green(), fg.blue())
-        step_y = max(1, h // 45)
-        gap_values: list[int] = []
-        for y in range(0, h, step_y):
-            run = 0
-            gaps: list[int] = []
-            in_text = False
-            for x in range(w):
-                c = QtGui.QColor(image.pixel(x, y))
-                rgb = (c.red(), c.green(), c.blue())
-                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
-                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
-                is_text = to_fg < to_bg and to_fg < 16000
-                if is_text:
-                    if not in_text and run > 0:
-                        gaps.append(run)
-                    in_text = True
-                    run = 0
-                else:
-                    if in_text:
-                        run = 1
-                    elif run > 0:
-                        run += 1
-                    in_text = False
-            compact_gaps = [g for g in gaps if 1 <= g <= 14]
-            if len(compact_gaps) >= 3:
-                gap_values.extend(compact_gaps)
-        if not gap_values:
-            return None
-        gap_values.sort()
-        baseline_gap = gap_values[len(gap_values) // 4]
-        spacing = max(0.0, float(baseline_gap - 1))
-        return min(20.0, spacing)
-
-    def _estimate_line_spacing(self, image: QtGui.QImage, bg_hex: str, font_hex: str) -> float | None:
-        w = image.width()
-        h = image.height()
-        if w < 20 or h < 20:
-            return None
-        bg = QtGui.QColor(bg_hex)
-        fg = QtGui.QColor(font_hex)
-        bg_rgb = (bg.red(), bg.green(), bg.blue())
-        fg_rgb = (fg.red(), fg.green(), fg.blue())
-        row_text_counts: list[int] = []
-        for y in range(h):
-            text_count = 0
-            for x in range(0, w, max(1, w // 220)):
-                c = QtGui.QColor(image.pixel(x, y))
-                rgb = (c.red(), c.green(), c.blue())
-                to_fg = self._rgb_distance_sq(rgb, fg_rgb)
-                to_bg = self._rgb_distance_sq(rgb, bg_rgb)
-                if to_fg < to_bg and to_fg < 16000:
-                    text_count += 1
-            row_text_counts.append(text_count)
-        active_rows = [i for i, count in enumerate(row_text_counts) if count >= 2]
-        if len(active_rows) < 8:
-            return None
-        text_runs: list[int] = []
-        gap_runs: list[int] = []
-        start = active_rows[0]
-        prev = active_rows[0]
-        for idx in active_rows[1:]:
-            if idx == prev + 1:
-                prev = idx
-                continue
-            text_runs.append(prev - start + 1)
-            gap_runs.append(idx - prev - 1)
-            start = idx
-            prev = idx
-        text_runs.append(prev - start + 1)
-        text_runs = [run for run in text_runs if run >= 2]
-        gap_runs = [gap for gap in gap_runs if gap >= 1]
-        if not text_runs or not gap_runs:
-            return None
-        text_runs.sort()
-        gap_runs.sort()
-        text_height = text_runs[len(text_runs) // 2]
-        gap_height = gap_runs[len(gap_runs) // 2]
-        line_spacing = (text_height + gap_height) / max(1, text_height)
-        return min(2.2, max(1.0, float(line_spacing)))
-
-    def _rgb_distance_sq(self, a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
-        dr = a[0] - b[0]
-        dg = a[1] - b[1]
-        db = a[2] - b[2]
-        return dr * dr + dg * dg + db * db
-
-    def _luminance(self, r: int, g: int, b: int) -> float:
-        return 0.2126 * r + 0.7152 * g + 0.0722 * b
-
     def back_to_home(self) -> None:
         if callable(self.on_back_home):
             self._save_window_geometry()
@@ -717,18 +484,11 @@ class ReaderWindow(QtWidgets.QMainWindow):
             self.on_back_home()
 
     def open_settings_dialog(self) -> None:
-        try:
-            from main import SettingsDialog
-        except Exception:
-            QtWidgets.QMessageBox.warning(self, "阅读设置", "无法打开阅读设置弹窗")
-            return
         dialog = SettingsDialog(self)
         if PYQT6:
-            accepted = dialog.exec()
+            dialog.exec()
         else:
-            accepted = dialog.exec_()
-        if not accepted:
-            return
+            dialog.exec_()
         self.config_data = self._load_config_data()
         self.font_family = self.config_data.get("font_family", self.font_family)
         self.font_size = int(self.config_data.get("font_size", self.font_size))
@@ -740,8 +500,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.line_spacing = min(2.2, max(1.0, self.line_spacing))
         self.bg_color = self.config_data.get("bg_color", self.bg_color)
         self.alpha = float(self.config_data.get("bg_alpha", self.alpha))
-        self.apply_style()
-        self._save_settings()
+        self.apply_opacity()
 
     def show_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
@@ -1109,69 +868,4 @@ class ReaderWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:
-        super().keyPressEvent(event)
-
-
-class RegionSelectionOverlay(QtWidgets.QWidget):
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._origin = QtCore.QPoint()
-        self._selected_rect: QtCore.QRect | None = None
-        self._loop = QtCore.QEventLoop(self)
-        shape = QtWidgets.QRubberBand.Shape.Rectangle if PYQT6 else QtWidgets.QRubberBand.Rectangle
-        self._rubber_band = QtWidgets.QRubberBand(shape, self)
-        flags = window_flag("FramelessWindowHint") | window_flag("WindowStaysOnTopHint") | window_flag("Tool")
-        self.setWindowFlags(flags)
-        self.setCursor(cursor_shape("CrossCursor"))
-        self.setWindowOpacity(0.25)
-        self.setStyleSheet("background-color: black;")
-        self._set_virtual_geometry()
-
-    def _set_virtual_geometry(self) -> None:
-        screen = QtGui.QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-        geo = screen.virtualGeometry()
-        self.setGeometry(geo)
-
-    def select_region(self) -> QtCore.QRect | None:
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        if PYQT6:
-            self._loop.exec()
-        else:
-            self._loop.exec_()
-        return self._selected_rect
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() != mouse_button("LeftButton"):
-            return
-        self._origin = local_pos(event)
-        self._rubber_band.setGeometry(QtCore.QRect(self._origin, QtCore.QSize()))
-        self._rubber_band.show()
-
-    def mouseMoveEvent(self, event) -> None:
-        if self._rubber_band.isVisible():
-            self._rubber_band.setGeometry(QtCore.QRect(self._origin, local_pos(event)).normalized())
-
-    def mouseReleaseEvent(self, event) -> None:
-        if event.button() != mouse_button("LeftButton"):
-            return
-        rect = self._rubber_band.geometry().normalized()
-        self._rubber_band.hide()
-        if rect.width() > 2 and rect.height() > 2:
-            top_left = self.geometry().topLeft()
-            self._selected_rect = QtCore.QRect(rect.topLeft() + top_left, rect.size())
-        else:
-            self._selected_rect = None
-        self.close()
-        self._loop.quit()
-
-    def keyPressEvent(self, event) -> None:
-        if event.key() == key("Key_Escape"):
-            self._selected_rect = None
-            self.close()
-            self._loop.quit()
-            return
         super().keyPressEvent(event)
