@@ -3,6 +3,7 @@ import ctypes.wintypes
 import json
 import os
 import pathlib
+import bisect
 
 from epub_utils import parse_epub_chapters, read_text_with_fallback
 from qt_compat import (
@@ -13,6 +14,7 @@ from qt_compat import (
     context_menu_policy,
     cursor_shape,
     event_type,
+    key,
     global_pos,
     local_pos,
     mouse_button,
@@ -20,7 +22,7 @@ from qt_compat import (
     window_flag,
     widget_attribute,
 )
-from services.config_service import load_config_data, save_config_data, update_recent_paths
+from services.config_service import get_base_path, load_config_data, save_config_data, update_recent_paths
 from services.style_detect_service import (
     capture_region_image,
     detect_style_colors,
@@ -45,6 +47,12 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.page_index = 0
         self.page_cache: dict[int, list[str]] = {}
         self.page_char_offsets: dict[int, list[int]] = {}
+        self.chapter_start_positions: list[int] = []
+        self.stream_start_chapter = 0
+        self.stream_loaded_end = -1
+        self.scroll_initial_chapters = 1
+        self.scroll_append_batch = 2
+        self.scroll_append_threshold = 240
         self.current_path: str | None = None
 
         self.font_family = "微软雅黑"
@@ -66,8 +74,11 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self._press_pos_window: QtCore.QPoint | None = None
         self._moved = False
         self._release_handled = False
+        self._restoring_scroll_stream = False
+        self._scroll_progress_tracking_active = False
+        self._pending_scroll_restore: int | None = None
 
-        self.progress_path = pathlib.Path.home() / ".epubrand_progress.json"
+        self.progress_path = get_base_path() / ".epubrand_progress.json"
         self.progress_data = self._load_progress_data()
         self.config_data = self._load_config_data()
         self.last_open_path = self.config_data.get("last_path", "")
@@ -85,6 +96,9 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.line_spacing = min(2.2, max(1.0, self.line_spacing))
         self.bg_color = self.config_data.get("bg_color", self.bg_color)
         self.alpha = float(self.config_data.get("bg_alpha", self.alpha))
+        self.reading_mode = str(self.config_data.get("reading_mode", "page"))
+        if self.reading_mode not in ("page", "scroll"):
+            self.reading_mode = "page"
 
         self.text = QtWidgets.QTextEdit()
         self.text.setReadOnly(True)
@@ -99,6 +113,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
         else:
             self.text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
             self.text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.text.verticalScrollBar().valueChanged.connect(self._on_scrollbar_value_changed)
         self.text.setStyleSheet(f"QTextEdit {{ background-color: {self.bg_color}; border: 0px; }}")
         self.setCentralWidget(self.text)
 
@@ -125,6 +140,7 @@ class ReaderWindow(QtWidgets.QMainWindow):
         # 4. 初始化样式和属性（不调用 show）
         self._restore_window_geometry()
         self.apply_style()
+        self._apply_reading_mode_ui()
         self.apply_anti_capture()
 
     def _load_progress_data(self) -> dict:
@@ -246,6 +262,170 @@ class ReaderWindow(QtWidgets.QMainWindow):
     def _window_pos_from_event(self, event) -> QtCore.QPoint:
         return self.mapFromGlobal(global_pos(event))
 
+    def _is_scroll_mode(self) -> bool:
+        return self.reading_mode == "scroll"
+
+    def _apply_reading_mode_ui(self) -> None:
+        if self._is_scroll_mode():
+            if PYQT6:
+                self.text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                self.text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            else:
+                self.text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+                self.text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        else:
+            if PYQT6:
+                self.text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                self.text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            else:
+                self.text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+                self.text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+    def _on_scrollbar_value_changed(self, _value: int) -> None:
+        if not self.current_path:
+            return
+        if self._restoring_scroll_stream:
+            return
+        if self._is_scroll_mode():
+            if not self._scroll_progress_tracking_active:
+                return
+            self._maybe_append_scroll_chapters()
+            self._sync_chapter_index_from_scroll()
+        self._save_progress()
+
+    def _sync_chapter_index_from_scroll(self) -> None:
+        if not self._is_scroll_mode() or not self.chapter_start_positions:
+            return
+        loaded_count = min(len(self.chapter_start_positions), self.stream_loaded_end + 1)
+        if loaded_count <= 0:
+            return
+        bar = self.text.verticalScrollBar()
+        if bar.value() <= bar.minimum():
+            self.chapter_index = min(max(0, self.stream_start_chapter), len(self.chapters) - 1)
+            return
+        viewport = self.text.viewport()
+        sample_x = max(1, min(viewport.width() - 1, viewport.width() // 3))
+        sample_y = max(1, min(viewport.height() - 1, 24))
+        sample_point = QtCore.QPoint(sample_x, sample_y)
+        cursor = self.text.cursorForPosition(sample_point)
+        pos = max(0, cursor.position())
+        idx = bisect.bisect_right(self.chapter_start_positions[:loaded_count], pos) - 1
+        if idx < 0:
+            idx = 0
+        self.chapter_index = min(idx, len(self.chapters) - 1)
+
+    def _reading_anchor_point(self) -> QtCore.QPoint:
+        viewport = self.text.viewport()
+        sample_x = max(1, min(viewport.width() - 1, viewport.width() // 3))
+        sample_y = max(1, min(viewport.height() - 1, 24))
+        return QtCore.QPoint(sample_x, sample_y)
+
+    def _normalize_chapter_progress(self, chapter_idx: int, char_pos: int) -> float:
+        if chapter_idx < 0 or chapter_idx >= len(self.chapters):
+            return 0.0
+        chapter_len = len(self.chapters[chapter_idx]["text"])
+        if chapter_len <= 1:
+            return 0.0
+        normalized = max(0, min(char_pos, chapter_len - 1)) / (chapter_len - 1)
+        return max(0.0, min(1.0, normalized))
+
+    def _chapter_char_pos_from_progress(self, chapter_idx: int, chapter_progress: float | None) -> int:
+        if chapter_idx < 0 or chapter_idx >= len(self.chapters):
+            return 0
+        progress = 0.0 if chapter_progress is None else max(0.0, min(1.0, float(chapter_progress)))
+        chapter_len = len(self.chapters[chapter_idx]["text"])
+        if chapter_len <= 1:
+            return 0
+        return int(round((chapter_len - 1) * progress))
+
+    def _current_progress_marker(self) -> tuple[int, float]:
+        chapter_idx = min(max(0, self.chapter_index), max(0, len(self.chapters) - 1))
+        if not self.chapters:
+            return 0, 0.0
+        if self._is_scroll_mode():
+            self._sync_chapter_index_from_scroll()
+            chapter_idx = min(max(0, self.chapter_index), len(self.chapters) - 1)
+            if self.text.verticalScrollBar().value() <= self.text.verticalScrollBar().minimum():
+                return chapter_idx, 0.0
+            cursor = self.text.cursorForPosition(self._reading_anchor_point())
+            doc_pos = max(0, cursor.position())
+            chapter_start = self.chapter_start_positions[chapter_idx] if chapter_idx < len(self.chapter_start_positions) else 0
+            local_pos = max(0, doc_pos - chapter_start)
+            return chapter_idx, self._normalize_chapter_progress(chapter_idx, local_pos)
+        cursor = self.text.cursorForPosition(self._reading_anchor_point())
+        local_pos = max(0, cursor.position())
+        return chapter_idx, self._normalize_chapter_progress(chapter_idx, local_pos)
+
+    def _apply_page_progress_restore(self, chapter_idx: int, chapter_progress: float | None) -> None:
+        local_pos = self._chapter_char_pos_from_progress(chapter_idx, chapter_progress)
+        cursor = QtGui.QTextCursor(self.text.document())
+        cursor.setPosition(max(0, local_pos))
+        self.text.setTextCursor(cursor)
+        self.text.ensureCursorVisible()
+
+    def _append_chapter_to_stream(self, chapter_idx: int) -> None:
+        if chapter_idx < 0 or chapter_idx >= len(self.chapters):
+            return
+        document = self.text.document()
+        cursor = QtGui.QTextCursor(document)
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End if PYQT6 else QtGui.QTextCursor.End)
+        current_count = max(0, document.characterCount() - 1)
+        chapter_text = self.chapters[chapter_idx]["text"]
+        if current_count > 0:
+            cursor.insertText("\n\n")
+            current_count += 2
+        if chapter_idx >= len(self.chapter_start_positions):
+            self.chapter_start_positions.extend([0] * (chapter_idx - len(self.chapter_start_positions) + 1))
+        self.chapter_start_positions[chapter_idx] = current_count
+        cursor.insertText(chapter_text)
+        self.stream_loaded_end = max(self.stream_loaded_end, chapter_idx)
+
+    def _build_scroll_stream(self, start_chapter: int, restore_progress: float | None) -> None:
+        self._restoring_scroll_stream = True
+        try:
+            self.text.clear()
+            self.chapter_start_positions = [0] * len(self.chapters)
+            if not self.chapters:
+                self.stream_start_chapter = 0
+                self.stream_loaded_end = -1
+                return
+            start = min(max(0, start_chapter), len(self.chapters) - 1)
+            self.stream_start_chapter = start
+            self.chapter_index = start
+            self.stream_loaded_end = start - 1
+            initial_end = min(len(self.chapters) - 1, start + self.scroll_initial_chapters - 1)
+            for idx in range(start, initial_end + 1):
+                self._append_chapter_to_stream(idx)
+            self._apply_text_spacing_format()
+            local_pos = self._chapter_char_pos_from_progress(start, restore_progress)
+            self._pending_scroll_restore = self.chapter_start_positions[start] + local_pos
+            QtCore.QTimer.singleShot(0, self._apply_pending_scroll_restore)
+        finally:
+            self._restoring_scroll_stream = False
+
+    def _apply_pending_scroll_restore(self) -> None:
+        pending = self._pending_scroll_restore
+        if pending is None:
+            return
+        self._pending_scroll_restore = None
+        cursor = QtGui.QTextCursor(self.text.document())
+        cursor.setPosition(max(0, pending))
+        self.text.setTextCursor(cursor)
+        self.text.ensureCursorVisible()
+
+    def _maybe_append_scroll_chapters(self) -> None:
+        if not self._is_scroll_mode() or not self.chapters:
+            return
+        if self.stream_loaded_end >= len(self.chapters) - 1:
+            return
+        bar = self.text.verticalScrollBar()
+        if bar.value() + self.scroll_append_threshold < bar.maximum():
+            return
+        target = min(len(self.chapters) - 1, self.stream_loaded_end + self.scroll_append_batch)
+        for idx in range(self.stream_loaded_end + 1, target + 1):
+            self._append_chapter_to_stream(idx)
+        self._apply_text_spacing_format()
+
     def apply_style(self) -> None:
         font = QtGui.QFont(self.font_family, self.font_size)
         spacing_type = QtGui.QFont.SpacingType.AbsoluteSpacing if PYQT6 else QtGui.QFont.AbsoluteSpacing
@@ -329,19 +509,25 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.chapter_index = 0
         self.update_view()
 
-    def update_view(self, restore_scroll: int | None = None) -> None:
+    def update_view(self, restore_progress: float | None = None) -> None:
         if not self.chapters:
             self.text.setPlainText("")
+            self.stream_loaded_end = -1
+            self.chapter_start_positions = []
             return
-
-        current_chapter_text = self.chapters[self.chapter_index]["text"]
-        if self.text.toPlainText() != current_chapter_text:
-            self.text.setPlainText(current_chapter_text)
-            self._apply_text_spacing_format()
-
-        if restore_scroll is not None:
-            self.text.verticalScrollBar().setValue(restore_scroll)
-        self._save_progress()
+        self.chapter_index = min(max(0, self.chapter_index), len(self.chapters) - 1)
+        if self._is_scroll_mode():
+            self._scroll_progress_tracking_active = False
+            self._build_scroll_stream(self.chapter_index, restore_progress)
+        else:
+            self.stream_loaded_end = self.chapter_index
+            current_chapter_text = self.chapters[self.chapter_index]["text"]
+            if self.text.toPlainText() != current_chapter_text:
+                self.text.setPlainText(current_chapter_text)
+                self._apply_text_spacing_format()
+            self._apply_page_progress_restore(self.chapter_index, restore_progress)
+        if not self._is_scroll_mode():
+            self._save_progress()
 
     def open_file(self) -> None:
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -397,8 +583,25 @@ class ReaderWindow(QtWidgets.QMainWindow):
         current = min(self.chapter_index, len(items) - 1)
         item, ok = QtWidgets.QInputDialog.getItem(self, "章节跳转", "选择章节", items, current, False)
         if ok and item in items:
-            self.chapter_index = items.index(item)
-            self.update_view()
+            target_index = items.index(item)
+            if self._is_scroll_mode():
+                self._scroll_progress_tracking_active = True
+                while self.stream_loaded_end < target_index:
+                    next_idx = self.stream_loaded_end + 1
+                    if next_idx >= len(self.chapters):
+                        break
+                    self._append_chapter_to_stream(next_idx)
+                self._apply_text_spacing_format()
+                self.chapter_index = target_index
+                chapter_pos = self.chapter_start_positions[target_index] if target_index < len(self.chapter_start_positions) else 0
+                cursor = QtGui.QTextCursor(self.text.document())
+                cursor.setPosition(max(0, chapter_pos))
+                self.text.setTextCursor(cursor)
+                self.text.ensureCursorVisible()
+                self._save_progress()
+            else:
+                self.chapter_index = target_index
+                self.update_view(restore_progress=0.0)
 
     def adaptive_detect_style(self) -> None:
         self.config_data = self._load_config_data()
@@ -479,6 +682,9 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def back_to_home(self) -> None:
         if callable(self.on_back_home):
+            if self._is_scroll_mode():
+                self._sync_chapter_index_from_scroll()
+                self._save_progress(force=True)
             self._save_window_geometry()
             self.close()
             self.on_back_home()
@@ -489,6 +695,12 @@ class ReaderWindow(QtWidgets.QMainWindow):
             dialog.exec()
         else:
             dialog.exec_()
+        old_mode = self.reading_mode
+        if self.chapters and self.current_path:
+            self.chapter_index, chapter_progress = self._current_progress_marker()
+            self._save_progress(force=True)
+        else:
+            chapter_progress = 0.0
         self.config_data = self._load_config_data()
         self.font_family = self.config_data.get("font_family", self.font_family)
         self.font_size = int(self.config_data.get("font_size", self.font_size))
@@ -500,6 +712,13 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self.line_spacing = min(2.2, max(1.0, self.line_spacing))
         self.bg_color = self.config_data.get("bg_color", self.bg_color)
         self.alpha = float(self.config_data.get("bg_alpha", self.alpha))
+        self.reading_mode = str(self.config_data.get("reading_mode", "page"))
+        if self.reading_mode not in ("page", "scroll"):
+            self.reading_mode = "page"
+        self._apply_reading_mode_ui()
+        if old_mode != self.reading_mode and self.chapters:
+            self.chapter_index = min(max(0, self.chapter_index), max(0, len(self.chapters) - 1))
+            self.update_view(restore_progress=chapter_progress)
         self.apply_opacity()
 
     def show_menu(self, pos: QtCore.QPoint) -> None:
@@ -531,11 +750,19 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def next_page(self) -> None:
         bar = self.text.verticalScrollBar()
+        if self._is_scroll_mode():
+            self._scroll_progress_tracking_active = True
+            step = max(1, int(self.text.viewport().height() * 0.85))
+            bar.setValue(bar.value() + step)
+            self._maybe_append_scroll_chapters()
+            self._sync_chapter_index_from_scroll()
+            self._save_progress()
+            return
         # 检查是否到底
         if bar.value() >= bar.maximum():
             if self.chapter_index < len(self.chapters) - 1:
                 self.chapter_index += 1
-                self.update_view(restore_scroll=0)
+                self.update_view(restore_progress=0.0)
         else:
             # 计算按行对齐的翻页距离
             line_height = self.get_line_height()
@@ -552,11 +779,18 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def prev_page(self) -> None:
         bar = self.text.verticalScrollBar()
+        if self._is_scroll_mode():
+            self._scroll_progress_tracking_active = True
+            step = max(1, int(self.text.viewport().height() * 0.85))
+            bar.setValue(bar.value() - step)
+            self._sync_chapter_index_from_scroll()
+            self._save_progress()
+            return
         # 检查是否到顶
         if bar.value() <= bar.minimum():
             if self.chapter_index > 0:
                 self.chapter_index -= 1
-                self.update_view()
+                self.update_view(restore_progress=1.0)
                 
                 # 计算到底部时的行对齐位置
                 line_height = self.get_line_height()
@@ -575,21 +809,41 @@ class ReaderWindow(QtWidgets.QMainWindow):
             bar.setValue(current_aligned - scroll_step)
             self._save_progress()
 
-    def _save_progress(self) -> None:
+    def _save_progress(self, force: bool = False) -> None:
         if not self.current_path:
+            return
+        if self._is_scroll_mode() and not self._scroll_progress_tracking_active and not force:
             return
         try:
             stat = os.stat(self.current_path)
-            scroll_val = self.text.verticalScrollBar().value()
+            chapter_idx, chapter_progress = self._current_progress_marker()
+            self.chapter_index = chapter_idx
             self.progress_data[self.current_path] = {
-                "chapter": self.chapter_index,
-                "scroll": scroll_val, # 使用滚动条位置替代页码
+                "chapter": chapter_idx,
+                "chapter_progress": chapter_progress,
                 "mtime": stat.st_mtime,
                 "size": stat.st_size,
             }
             self._save_progress_data()
         except Exception:
             pass
+
+    def _get_saved_progress(self, file_path: str) -> tuple[int, float]:
+        saved = self.progress_data.get(file_path)
+        if not isinstance(saved, dict):
+            return 0, 0.0
+        try:
+            stat = os.stat(file_path)
+        except Exception:
+            return 0, 0.0
+        if saved.get("mtime") != stat.st_mtime or saved.get("size") != stat.st_size:
+            return 0, 0.0
+        try:
+            chapter = int(saved.get("chapter", 0))
+            chapter_progress = float(saved.get("chapter_progress", 0.0))
+        except Exception:
+            return 0, 0.0
+        return chapter, max(0.0, min(1.0, chapter_progress))
 
     def load_file(self, file_path: str) -> None:
         try:
@@ -611,17 +865,9 @@ class ReaderWindow(QtWidgets.QMainWindow):
             else:
                 raise ValueError("暂不支持该格式")
                 
-            saved = self.progress_data.get(self.current_path)
-            restore_scroll = 0
-            if saved:
-                try:
-                    stat = os.stat(self.current_path)
-                    if saved.get("mtime") == stat.st_mtime and saved.get("size") == stat.st_size:
-                        self.chapter_index = int(saved.get("chapter", 0))
-                        restore_scroll = int(saved.get("scroll", 0))
-                except Exception:
-                    pass
-            self.update_view(restore_scroll=restore_scroll)
+            saved_chapter, restore_progress = self._get_saved_progress(self.current_path)
+            self.chapter_index = min(max(0, saved_chapter), max(0, len(self.chapters) - 1))
+            self.update_view(restore_progress=restore_progress)
             self._remember_last_path(self.current_path)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "加载失败", str(e))
@@ -741,6 +987,8 @@ class ReaderWindow(QtWidgets.QMainWindow):
         self._update_cursor(None)
 
     def _handle_click(self, local: QtCore.QPoint, pos_window: QtCore.QPoint) -> bool:
+        if self._is_scroll_mode():
+            return False
         if self._hit_test_resize(pos_window):
             return False
         width = max(1, self.text.viewport().width())
@@ -769,6 +1017,10 @@ class ReaderWindow(QtWidgets.QMainWindow):
         return handled
 
     def _handle_wheel(self, delta: int) -> bool:
+        if self._is_scroll_mode():
+            return False
+        if delta == 0:
+            return True
         bar = self.text.verticalScrollBar()
         line_height = self.get_line_height()
         step = line_height * 3
@@ -813,6 +1065,11 @@ class ReaderWindow(QtWidgets.QMainWindow):
                 if self._handle_release(event, pos_w, local):
                     return True
             elif event.type() == event_type("Wheel"):
+                if not self._is_scroll_mode():
+                    event.accept()
+                    return True
+                self._scroll_progress_tracking_active = True
+                self._maybe_append_scroll_chapters()
                 try:
                     delta = event.angleDelta().y()
                 except Exception:
@@ -836,6 +1093,11 @@ class ReaderWindow(QtWidgets.QMainWindow):
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event) -> None:
+        if not self._is_scroll_mode():
+            event.accept()
+            return
+        self._scroll_progress_tracking_active = True
+        self._maybe_append_scroll_chapters()
         try:
             delta = event.angleDelta().y()
         except Exception:
@@ -861,11 +1123,30 @@ class ReaderWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.snap_to_line()
+        if not self._is_scroll_mode():
+            self.snap_to_line()
 
     def closeEvent(self, event) -> None:
+        if self._is_scroll_mode():
+            self._sync_chapter_index_from_scroll()
+            self._save_progress(force=True)
         self._save_window_geometry()
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:
+        if self._is_scroll_mode():
+            event_key = event.key()
+            if event_key == key("Key_Down"):
+                self._scroll_progress_tracking_active = True
+                self.text.verticalScrollBar().setValue(self.text.verticalScrollBar().value() + self.get_line_height() * 3)
+                self._maybe_append_scroll_chapters()
+                self._sync_chapter_index_from_scroll()
+                self._save_progress()
+                return
+            if event_key == key("Key_Up"):
+                self._scroll_progress_tracking_active = True
+                self.text.verticalScrollBar().setValue(self.text.verticalScrollBar().value() - self.get_line_height() * 3)
+                self._sync_chapter_index_from_scroll()
+                self._save_progress()
+                return
         super().keyPressEvent(event)

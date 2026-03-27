@@ -28,6 +28,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.font_spacing = min(20.0, max(0.0, self.font_spacing))
         self.line_spacing = min(2.2, max(1.0, self.line_spacing))
         self.bg_alpha = float(self.config_data.get("bg_alpha", DEFAULT_CONFIG["bg_alpha"]))
+        self.reading_mode = str(self.config_data.get("reading_mode", DEFAULT_CONFIG.get("reading_mode", "page")))
+        if self.reading_mode not in ("page", "scroll"):
+            self.reading_mode = "page"
         adaptive_targets = self.config_data.get("adaptive_targets", {})
         self.use_adaptive_font_color = bool(adaptive_targets.get("font_color", True)) if isinstance(adaptive_targets, dict) else True
         self.use_adaptive_font_size = bool(adaptive_targets.get("font_size", True)) if isinstance(adaptive_targets, dict) else True
@@ -56,6 +59,19 @@ class SettingsDialog(QtWidgets.QDialog):
             text = "0% (仅文字)" if val == 0.0 else f"{int(val * 100)}%"
             self.bg_alpha_combo.addItem(text, val)
         form.addRow("背景不透明度", self.bg_alpha_combo)
+        self.reading_mode_group = QtWidgets.QButtonGroup(self)
+        self.page_mode_radio = QtWidgets.QRadioButton("左右翻页")
+        self.scroll_mode_radio = QtWidgets.QRadioButton("上下滚动")
+        self.reading_mode_group.addButton(self.page_mode_radio)
+        self.reading_mode_group.addButton(self.scroll_mode_radio)
+        reading_mode_row = QtWidgets.QWidget()
+        reading_mode_layout = QtWidgets.QHBoxLayout(reading_mode_row)
+        reading_mode_layout.setContentsMargins(0, 0, 0, 0)
+        reading_mode_layout.setSpacing(16)
+        reading_mode_layout.addWidget(self.page_mode_radio)
+        reading_mode_layout.addWidget(self.scroll_mode_radio)
+        reading_mode_layout.addStretch(1)
+        form.addRow("翻页方式", reading_mode_row)
         self.font_spacing_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal if PYQT6 else QtCore.Qt.Horizontal)
         self.font_spacing_slider.setRange(0, 20)
         self.font_spacing_slider.setSingleStep(1)
@@ -127,6 +143,16 @@ class SettingsDialog(QtWidgets.QDialog):
             if PYQT6
             else QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
+        ok_button = self.button_box.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok if PYQT6 else QtWidgets.QDialogButtonBox.Ok
+        )
+        cancel_button = self.button_box.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel if PYQT6 else QtWidgets.QDialogButtonBox.Cancel
+        )
+        if ok_button is not None:
+            ok_button.setText("确定")
+        if cancel_button is not None:
+            cancel_button.setText("取消")
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
@@ -136,6 +162,7 @@ class SettingsDialog(QtWidgets.QDialog):
             "QPushButton { background: #E5E7EB; border: 1px solid #D1D5DB; border-radius: 8px; padding: 6px 10px; color: #111827; }"
             "QPushButton:hover { background: #DDE1E6; }"
             "QComboBox { background: #FFFFFF; border: 1px solid #D1D5DB; border-radius: 8px; padding: 6px 8px; }"
+            "QRadioButton { color: #374151; spacing: 6px; }"
             "QFrame#sectionDivider { background: #D1D5DB; min-height: 1px; max-height: 1px; border: none; margin-top: 6px; margin-bottom: 6px; }"
             "QPushButton#adaptiveBtn { background: #D7E3F3; border: 1px solid #AFC4DE; color: #0F2742; font-weight: 600; }"
             "QPushButton#adaptiveBtn:hover { background: #C9DAEF; }"
@@ -161,10 +188,22 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         self._set_combo_value(self.font_alpha_combo, self.font_alpha)
         self._set_combo_value(self.bg_alpha_combo, self.bg_alpha)
+        self._set_reading_mode_value()
         self.font_spacing_slider.setValue(int(round(self.font_spacing)))
         self.line_spacing_slider.setValue(int(round(self.line_spacing * 100)))
         self.font_spacing_value.setText(f"{int(round(self.font_spacing))} px")
         self.line_spacing_value.setText(f"{int(round(self.line_spacing * 100))}%")
+
+    def _set_reading_mode_value(self) -> None:
+        if self.reading_mode == "scroll":
+            self.scroll_mode_radio.setChecked(True)
+            return
+        self.page_mode_radio.setChecked(True)
+
+    def _selected_reading_mode(self) -> str:
+        if self.scroll_mode_radio.isChecked():
+            return "scroll"
+        return "page"
 
     def _set_combo_value(self, combo: QtWidgets.QComboBox, value: float) -> None:
         for i in range(combo.count()):
@@ -349,6 +388,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config_data["font_spacing"] = self.font_spacing
         self.config_data["line_spacing"] = self.line_spacing
         self.config_data["bg_alpha"] = self.bg_alpha
+        self.config_data["reading_mode"] = self._selected_reading_mode()
         self.config_data["adaptive_targets"] = {
             "font_color": self.adaptive_font_color_check.isChecked(),
             "font_size": self.adaptive_font_size_check.isChecked(),

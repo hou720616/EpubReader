@@ -15,6 +15,7 @@ DEFAULT_CONFIG = {
     "line_spacing": 1.0,
     "bg_color": "#F2F2F2",
     "bg_alpha": 1.0,
+    "reading_mode": "page",
     "shortcuts": {
         "prev_page": "A",
         "next_page": "D",
@@ -54,6 +55,9 @@ def load_config_data() -> dict:
         pass
     if not isinstance(config.get("recent_paths"), list):
         config["recent_paths"] = []
+    reading_mode = config.get("reading_mode")
+    if reading_mode not in ("page", "scroll"):
+        config["reading_mode"] = "page"
     shortcuts = config.get("shortcuts")
     if not isinstance(shortcuts, dict):
         config["shortcuts"] = copy.deepcopy(DEFAULT_CONFIG["shortcuts"])
